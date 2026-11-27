@@ -1,4 +1,8 @@
-"""Leica M9 (firmware 1.216) engine: dual-DCP bridge into M9 raw, bf547 AWB, BF561 5x5 colour kernel.
+"""Leica M9 (firmware 1.216) engine: dual-DCP bridge into M9 raw, bf547 AWB, BF561 5x5 colour kernel and B&W.
+
+B&W (the menu's monochrome) is the 11th matrix pair, the Rec. 709 luminance row applied straight to the white-balanced camera
+RGB, with its own five tone curves; those curves are laid out for one stop more signal than the colour ones, so the B&W index
+is floor(value / 32768) (the 18 % grey then leaves at sRGB 118 - 127, as the colour look's 112 - 124).
 
 Exposure is bridged to the M9 standard rendering at BE_M9 = -0.5: k = 2^(EV + BE_src - BE_M9).
 """
@@ -25,7 +29,7 @@ M9_CM2 = np.array([[0.6687, -0.1751, -0.0291], [-0.3556, 1.1373, 0.2492], [-0.05
 
 
 def decode_m9_bin(path: Path = DEFAULT_M9_LOOK) -> dict:
-    """Decode the Leica M9 firmware 1.216 kind-10 look (Adobe FM/HSM + BF561 records + 5 curves)."""
+    """Decode the Leica M9 firmware 1.216 kind-10 look (Adobe FM/HSM + BF561 records + 5 curves + B&W matrix + 5 B&W curves)."""
     b = Path(path).read_bytes()
     if b[:8] != b"MCOLLOOK":
         raise ValueError(f"Invalid look magic in {path}")
@@ -37,13 +41,15 @@ def decode_m9_bin(path: Path = DEFAULT_M9_LOOK) -> dict:
     fm = np.frombuffer(b, "<f4", 18, at).astype(np.float64).reshape(2, 3, 3); at += 72
     records = np.frombuffer(b, "<i4", 90, at).reshape(5, 2, 3, 3).copy(); at += 360
     curves = (np.frombuffer(b, np.uint8, 5 * 2048, at).reshape(5, 2048).astype(np.float32) / 255.0).copy(); at += 5 * 2048
+    mono = np.frombuffer(b, "<i4", 9, at).reshape(3, 3).copy(); at += 36
+    mono_curves = (np.frombuffer(b, np.uint8, 5 * 2048, at).reshape(5, 2048).astype(np.float32) / 255.0).copy(); at += 5 * 2048
     hd, sd, t1, t2 = struct.unpack_from("<IIff", b, at); at += 16
     n = hd * sd * 3
     tb = [np.frombuffer(b, "<f4", n, at + 4 * n * i).astype(np.float64).reshape(hd, sd, 3).copy() for i in range(2)]
     if at + 8 * n != len(b):
         raise ValueError(f"Corrupt look size in {path}")
     profile = DcpProfile(name="Leica M9 Adobe Standard", cm=[M9_CM1, M9_CM2], fm=[fm[0], fm[1]], hsm=tb, t1=t1, t2=t2)
-    return {"scale": float(scale), "profile": profile, "records": records, "curves": curves}
+    return {"scale": float(scale), "profile": profile, "records": records, "curves": curves, "mono": mono, "mono_curves": mono_curves}
 
 
 def exposure(frame: RawFrame, src: DcpProfile, ev: float) -> tuple[float, int]:
@@ -126,23 +132,29 @@ def solve_wb(cam_rgb: np.ndarray, src: DcpProfile, src_neutral: np.ndarray, k_to
     return dict(mode="auto", white=white, gain=g, xy=xy, cct=cct, duv=duv, rounds=len(history) + 1)
 
 
-def m9_kernel_t(m9raw_wb: torch.Tensor, records_2x3x3: torch.Tensor, curve_2048: torch.Tensor) -> torch.Tensor:
-    """BF561 ASMExecuteColorMatrix: white-balanced M9 raw (N, 3) -> sRGB-encoded (N, 3)."""
+def m9_kernel_t(m9raw_wb: torch.Tensor, records_2x3x3: torch.Tensor, curve_2048: torch.Tensor, index_div: float = 65536.0) -> torch.Tensor:
+    """BF561 ASMExecuteColorMatrix: white-balanced M9 raw (N, 3) -> sRGB-encoded (N, 3). B&W: both matrices the luminance
+    matrix and index_div 32768."""
     px = torch.floor(torch.clamp(m9raw_wb, 0.0, 1.0) * 16383.0)
     first = (px[:, 0] >= px[:, 1]).unsqueeze(-1)
     val = torch.where(first, px @ records_2x3x3[0].T, px @ records_2x3x3[1].T)
-    idx = torch.floor(val / 65536.0).long().clamp(0, 2047)
+    idx = torch.floor(val / index_div).long().clamp(0, 2047)
     return curve_2048[idx]
 
 
 def render(cam_rgb: np.ndarray, src: DcpProfile, look: dict, wb_state: dict, k_to_m9: float, *,
-           contrast: int = 0, saturation: int = 0, use_hsm: bool = True, out_space: str = "srgb",
+           contrast: int = 0, saturation: int = 0, mono: bool = False, use_hsm: bool = True, out_space: str = "srgb",
            device: str = "auto", chunk_pixels: int = 8_000_000) -> np.ndarray:
     """Sensor-oriented camera RGB -> dual-DCP -> M9 raw x AWB gain -> BF561 kernel -> encoded output."""
     dev = resolve_device(device)
     bridge = DualDcpBridge(src, look["profile"], wb_state["white"], k_to_m9, use_hsm, dev)
     g_t = as_t(wb_state["gain"], dev)
-    rec_t = as_t(look["records"][int(np.clip(round(saturation), -2, 2)) + 2], dev)
-    curve_t = as_t(look["curves"][int(np.clip(round(contrast), -2, 2)) + 2], dev)
-    fn = lambda c: encode_from_srgb_t(m9_kernel_t(bridge(c) * g_t, rec_t, curve_t), out_space, dev)
+    step = int(np.clip(round(contrast), -2, 2)) + 2
+    if mono:
+        rec_t = as_t(np.stack([look["mono"], look["mono"]]), dev)
+        curve_t, div = as_t(look["mono_curves"][step], dev), 32768.0
+    else:
+        rec_t = as_t(look["records"][int(np.clip(round(saturation), -2, 2)) + 2], dev)
+        curve_t, div = as_t(look["curves"][step], dev), 65536.0
+    fn = lambda c: encode_from_srgb_t(m9_kernel_t(bridge(c) * g_t, rec_t, curve_t, div), out_space, dev)
     return map_pixels(cam_rgb, fn, dev, chunk_pixels)

@@ -2,6 +2,8 @@
 
 WB and the dual-DCP hand-off stay inside one calibrator: M240 Adobe Standard CM / FM / HSM for the
 scene white, the gain and the bridge (Leica DNG-embedded ColorMatrix is never mixed with Adobe FM/HSM).
+--wb auto runs the camera's own IMG-DSP-212 AWB (m240_awb.py) on its 30 x 30 windows of the bridged M240 raw, iterated
+from D65 to the dual-DCP fixed point.
 Exposure: DNG WhiteLevel 15000 shifted right 2 bits into the 12-bit colorcomp scale (3750), BE_M240 = 0.0.
 """
 import struct
@@ -11,11 +13,12 @@ import numpy as np
 import torch
 
 from ..core.bridge import DualDcpBridge
-from ..core.color import cct_duv, parse_wb_cct_duv, white_xyz_from_cct_duv
+from ..core.color import XYZ_D65, cct_duv, parse_wb_cct_duv, white_xyz_from_cct_duv
 from ..core.dcp import DcpProfile
 from ..core.gpu import as_t, map_pixels, resolve_device
 from ..core.output import encode_from_srgb_t
 from ..core.raw import RawFrame
+from .m240_awb import WHITE_LEVEL, Awb, blocks_of_means, sample_windows
 
 DEFAULT_M240P_LOOK = Path(__file__).resolve().parent.parent.parent / "assets" / "m240p" / "leica_m240p.bin"
 BE_M240 = 0.0
@@ -60,9 +63,57 @@ def exposure(frame: RawFrame, src: DcpProfile, ev: float) -> float:
     return float(2.0 ** (ev + src_base_ev - BE_M240))
 
 
-def solve_wb(src: DcpProfile, src_neutral: np.ndarray, wb_spec: str, look: dict) -> dict:
-    """camera: source Adobe CM -> scene white; CCT[,Duv]: the given white. Gain from M240 Adobe CM either way."""
+def metered_bv(frame: RawFrame) -> int:
+    """Metered BV x 256 of the frame (APEX, the source's own raw exposure base)."""
+    if frame.ev100 is None:
+        return 1500
+    return round((frame.ev100 + frame.raw_base_ev(raf_input_scale=True) - 5.0) * 256)
+
+
+def _auto(cam_rgb: np.ndarray, src: DcpProfile, adobe: DcpProfile, k_to_m240: float, bv: int, awb: Awb,
+          use_hsm: bool, device: str) -> dict:
+    """The M240 AWB on its 30 x 30 windows of the bridged M240 raw, iterated from D65 to the dual-DCP fixed point."""
+    dev = resolve_device(device)
+    H, W, _ = cam_rgb.shape
+    ys, xs, wy, wx = sample_windows(H, W)
+    patches = np.stack([cam_rgb[y0:y0 + wy, x0:x0 + wx] for y0 in ys for x0 in xs], axis=0)
+    patches_t = torch.from_numpy(np.ascontiguousarray(patches.reshape(-1, 3))).to(device=dev, dtype=torch.float32)
+    white = XYZ_D65.copy()
+    history = []
+    gains, xy = (256, 256, 256), (0, 0)
+    with torch.no_grad():
+        for _ in range(8):
+            bridge = DualDcpBridge(src, adobe, white, k_to_m240, use_hsm, dev, inverse="iterate", rounds=24)
+            means = bridge(patches_t).reshape(900, wy * wx, 3).mean(dim=1).cpu().numpy()
+            gains, xy = awb.run(blocks_of_means(means), bv)
+            if xy in history or gains[0] <= 0 or gains[2] <= 0:
+                break
+            history.append(xy)
+            white = adobe.white_of_neutral(np.array([256.0 / gains[0], 1.0, 256.0 / gains[2]]))[0]
+    return {"white": white, "gains": gains, "xy": xy, "rounds": len(history) + 1}
+
+
+def solve_wb(src: DcpProfile, src_neutral: np.ndarray, wb_spec: str, look: dict, *, cam_rgb: np.ndarray | None = None,
+             k_to_m240: float = 1.0, bv: int = 1500, use_hsm: bool = True, device: str = "auto") -> dict:
+    """camera: source Adobe CM -> scene white; CCT[,Duv]: the given white; auto: the M240's own AWB (needs cam_rgb).
+    Gain from the M240 Adobe CM for camera / CCT, the firmware's Q8 gains for auto."""
     adobe = look["adobe_profile"]
+    if wb_spec.strip().lower() == "auto":
+        if cam_rgb is None:
+            raise ValueError("--wb auto needs the frame")
+        r = _auto(cam_rgb, src, adobe, k_to_m240, bv, Awb(), use_hsm, device)
+        cct_scene, duv_scene = cct_duv(r["white"])
+        neutral = np.array([256.0 / r["gains"][0], 1.0, 256.0 / r["gains"][2]])
+        return {
+            "mode": "auto",
+            "white_scene": r["white"],
+            "cct_scene": float(cct_scene),
+            "duv_scene": float(duv_scene),
+            "neutral_m240": neutral,
+            "gain": 1.0 / neutral,
+            "xy": r["xy"],
+            "rounds": r["rounds"],
+        }
     mode, cct_in, duv_in = parse_wb_cct_duv(wb_spec)
     if mode == "camera":
         white_scene, cct_scene = src.white_of_neutral(src_neutral)

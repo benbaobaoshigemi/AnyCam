@@ -60,6 +60,7 @@ def build_parser() -> argparse.ArgumentParser:
                    help=f"auto (M9 AWB, default), camera (RAW WB), preset ({', '.join(PRESET_NAMES)}) or Kelvin e.g. 5200K")
     g.add_argument("--contrast", type=int, choices=[-2, -1, 0, 1, 2], default=0, help="Contrast -2 .. +2 (default: 0)")
     g.add_argument("--saturation", type=int, choices=[-2, -1, 0, 1, 2], default=0, help="Saturation -2 .. +2 (default: 0)")
+    g.add_argument("--mono", action="store_true", help="The camera's B&W (luminance of the camera RGB, its own five tone curves)")
     g.add_argument("--bv", type=int, default=None, help="Override metered BV (APEX BV x 256) for --wb auto")
     g.add_argument("--iso-gate", default="off", help="AWB ISO block gate: off (default, thr 100), raw (EXIF ISO) or an ISO value")
     g.add_argument("--ref", choices=["reference", "factory"], default="reference", help="M9 body calibration (default: reference)")
@@ -75,7 +76,9 @@ def build_parser() -> argparse.ArgumentParser:
     t = sub.add_parser("m240p", help="Leica M (Typ 240) / M-P (fw 2.1.0.0) Film Modes + Monochrome")
     _common(t)
     g = t.add_argument_group("Leica M (Typ 240)")
-    g.add_argument("--wb", default="camera", help="camera (RAW WB, default) or <CCT>[K][,<Duv>] e.g. 5200K or 5200K,-0.002")
+    g.add_argument("--wb", default="camera",
+                   help="camera (RAW WB, default), auto (M240 AWB) or <CCT>[K][,<Duv>] e.g. 5200K or 5200K,-0.002")
+    g.add_argument("--bv", type=int, default=None, help="Override metered BV (APEX BV x 256) for --wb auto")
     g.add_argument("--mode", choices=["standard", "vivid", "natural"], default="standard", help="Film Mode (default: standard)")
     g.add_argument("--contrast", type=int, choices=[-2, -1, 0, 1, 2], default=0, help="Standard contrast -2 .. +2 (default: 0)")
     g.add_argument("--saturation", type=int, choices=[-2, -1, 0, 1, 2], default=0, help="Standard saturation -2 .. +2 (default: 0)")
@@ -128,12 +131,12 @@ def run_m9(args, frame, dev):
         ref=REF_REFERENCE_BODY if args.ref == "reference" else REF_FACTORY,
         iso=_parse_iso_gate(args.iso_gate, frame.iso), use_hsm=not args.no_hsm, device=args.device,
     )
-    out = m9.render(frame.cam_rgb, src, look, wb, k, contrast=args.contrast, saturation=args.saturation,
+    out = m9.render(frame.cam_rgb, src, look, wb, k, contrast=args.contrast, saturation=args.saturation, mono=args.mono,
                     use_hsm=not args.no_hsm, out_space=args.out_space, device=args.device)
     out = orient_np(out, frame.flip)
     desc = (f"wb={wb['mode']} xy={wb['xy']} CCT={wb['cct']:.0f}K Duv={wb['duv']:+.4f} bv={bv} | "
-            f"C={args.contrast:+d} S={args.saturation:+d}")
-    return out, desc, f"m9_{args.wb}_c{args.contrast:+d}_s{args.saturation:+d}"
+            f"C={args.contrast:+d} " + ("B&W" if args.mono else f"S={args.saturation:+d}"))
+    return out, desc, f"m9_{args.wb}_c{args.contrast:+d}_" + ("mono" if args.mono else f"s{args.saturation:+d}")
 
 
 def run_m10r(args, frame, dev):
@@ -158,7 +161,9 @@ def run_m240p(args, frame, dev):
     src = DcpProfile(args.dcp)
     look = m240p.decode_m240p_bin()
     k = m240p.exposure(frame, src, args.ev)
-    wb = m240p.solve_wb(src, frame.neutral, args.wb, look)
+    bv = args.bv if args.bv is not None else m240p.metered_bv(frame)
+    wb = m240p.solve_wb(src, frame.neutral, args.wb, look, cam_rgb=frame.cam_rgb, k_to_m240=k, bv=bv,
+                        use_hsm=not args.no_hsm, device=args.device)
     out = m240p.render(frame.cam_rgb, src, look, wb, k, mode=args.mode, contrast=args.contrast,
                        saturation=args.saturation, mono=args.mono, use_hsm=not args.no_hsm,
                        out_space=args.out_space, device=args.device)
@@ -166,7 +171,8 @@ def run_m240p(args, frame, dev):
     style = f"{args.mode} C={args.contrast:+d} S={args.saturation:+d}" if args.mode == "standard" else args.mode
     if args.mono:
         style += " mono"
-    desc = f"wb={wb['mode']} scene={wb['cct_scene']:.0f}K({wb['duv_scene']:+.4f}) | {style}"
+    awb = f" xy={wb['xy']} bv={bv} rounds={wb['rounds']}" if wb["mode"] == "auto" else ""
+    desc = f"wb={wb['mode']}{awb} scene={wb['cct_scene']:.0f}K({wb['duv_scene']:+.4f}) | {style}"
     tag = f"m240p_{args.wb}_{args.mode}" + (f"_c{args.contrast:+d}_s{args.saturation:+d}" if args.mode == "standard" else "")
     return out, desc, tag + ("_mono" if args.mono else "")
 

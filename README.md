@@ -5,9 +5,9 @@
 | 子命令 | 引擎 | 挡位 |
 | --- | --- | --- |
 | `fuji` | 富士 X100VI 胶片模拟（kind-13，20 种）+ 标定颗粒 | DR100/200、高光/阴影、色彩、白平衡偏移、CCE / FX Blue、颗粒强弱/大小 |
-| `m9` | 徕卡 M9 固件 1.216，BF561 色彩内核 + bf547 自动白平衡 | 对比度 × 饱和度 5×5；AWB / 原片 / 预设 / 63 档开尔文 |
+| `m9` | 徕卡 M9 固件 1.216，BF561 色彩内核 + bf547 自动白平衡 | 对比度 × 饱和度 5×5、原机黑白；AWB / 原片 / 预设 / 63 档开尔文 |
 | `m10r` | 徕卡 M10-R 固件 40.26.35.51，CA9 `CC0` + B2Y 内核 | 对比度 × 饱和度 3×3、黑白 |
-| `m240p` | 徕卡 M (Typ 240) / M-P 固件 2.1.0.0 | Standard 5×5、Vivid、Natural、黑白 |
+| `m240p` | 徕卡 M (Typ 240) / M-P 固件 2.1.0.0，IMG-DSP-212 自动白平衡 | Standard 5×5、Vivid、Natural、黑白；AWB / 原片 / 指定色温 |
 
 ## 安装
 
@@ -33,6 +33,8 @@ python run_anycam.py m9 --raw IMG.dng --dcp "OPPO Find X9 Ultra wide camera 23mm
 
 python run_anycam.py m10r --raw IMG.dng --dcp X.dcp --wb 4800K,-0.001 --contrast 1 --out out.png
 python run_anycam.py m240p --raw IMG.dng --dcp X.dcp --mode vivid --wb camera --out out.tif
+python run_anycam.py m240p --raw IMG.dng --dcp X.dcp --wb auto --out out.jpg
+python run_anycam.py m9 --raw IMG.dng --dcp X.dcp --mono --contrast 1 --out out.jpg
 ```
 
 所有子命令共用：`--raw`、`--dcp`、`--out`（`.png` / `.jpg` 8 位，`.tif` 16 位）、`--out-space {srgb,p3,adobe}`、`--ev`、`--denoise {off,low,medium,high}`、`--no-hsm`、`--half-size`、`--device {auto,cuda,cpu}`。各引擎的挡位见 `python run_anycam.py <子命令> --help`。
@@ -57,9 +59,9 @@ RAW ─ rawpy 线性解马赛克（传感器原向）─ [降噪] ─ 引擎 ─
 
 源机 Adobe Standard 的 `ForwardMatrix + HueSatMap` 把画面送进线性 ProPhoto D50，再反解目标机 Adobe Standard 的 `HueSatMap + ForwardMatrix` 回到目标机 raw；两端出自同一标定者，交接白点相同，不使用 `ProfileToneCurve`。整帧渲染用预建的二维逆 HSM 表做起点加两步迭代，M9 AWB 循环用 24 步纯迭代。
 
-- **M9**：`BE_M9 = −0.5`。`--wb auto` 在传感器原向 20×30 阵列的内区 19×29 上按 4×4 稀疏小窗（B 通道左错一格）取样，代入 bf547 AWB（`assets/m9/awb_p3.bin`），从 D65 起步迭代到不动点；另有原片白平衡、固件预设、63 档开尔文表。
+- **M9**：`BE_M9 = −0.5`。`--wb auto` 在传感器原向 20×30 阵列的内区 19×29 上按 4×4 稀疏小窗（B 通道左错一格）取样，代入 bf547 AWB（`assets/m9/awb_p3.bin`），从 D65 起步迭代到不动点；另有原片白平衡、固件预设、63 档开尔文表。`--mono` 是原机黑白：第 11 对矩阵（Rec. 709 亮度，直接作用于白平衡后的相机 RGB）加专用五档影调；黑白曲线按多一档信号排布，下标取 `value / 32768`，18% 灰落在 sRGB 118–127，与彩色同为相机测光口径。
 - **M10-R**：`BE_M10R = 0`，白电平 15000。`--wb camera`：源机 Adobe `CM` 求场景白点 → M10-R Adobe `CM` 求增益 → 固件 `CM_LT / CM_HT` 求 `CCT_fw` 驱动 `CC0`。`--wb <CCT>[K][,<Duv>]`：先由固件 `CM_LT / CM_HT` 得增益与 `CC0`，再用 Adobe 侧 `white_of_neutral(1/gain)` 统一交接白点。
-- **M240**：`BE_M240 = 0`，14 位白电平 15000 右移 2 位进 12 位 `colorcomp`（`3750`）。场景白点、增益、对接全部用 M240 Adobe Standard 的 `CM / FM / HSM`，不把 Leica DNG 内嵌 `ColorMatrix` 混接到 Adobe `FM / HSM`。
+- **M240**：`BE_M240 = 0`，14 位白电平 15000 右移 2 位进 12 位 `colorcomp`（`3750`）。场景白点、增益、对接全部用 M240 Adobe Standard 的 `CM / FM / HSM`，不把 Leica DNG 内嵌 `ColorMatrix` 混接到 Adobe `FM / HSM`。`--wb auto` 运行机身 IMG-DSP-212 自动白平衡（`assets/m240p/m240_awb.bin`，固件 `IMG_PARA + 0x518` 参数表与 ROM 默认定标，在真机 MakerNote `0x0301` 统计块上逐比特一致）：在传感器原向的 30×30 窗口（2000×2992 色彩平面上行 `183 + 56i`、列 `128 + 94j`、8×8）上取桥接后的 M240 raw（白电平 15000），从 D65 起步迭代到不动点。
 
 ### 富士 X100VI（`anycam/engines/fuji.py`）
 
@@ -69,4 +71,4 @@ X100VI HSM 的 16 轮反解按帧预建成表：二维 HSM 下，H/S 的迭代�
 
 ## 资产
 
-`assets/` 只放查找表：`fuji/x100vi_*.bin`（20 个）、`m9/leica_m9.bin` 与 `m9/awb_p3.bin`、`m10r/leica_m10r.bin`、`m240p/leica_m240p.bin`，共约 3.2 MB。
+`assets/` 只放查找表：`fuji/x100vi_*.bin`（20 个）、`m9/leica_m9.bin` 与 `m9/awb_p3.bin`、`m10r/leica_m10r.bin`、`m240p/leica_m240p.bin` 与 `m240p/m240_awb.bin`，共约 3.2 MB。

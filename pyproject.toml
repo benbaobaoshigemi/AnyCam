@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "anycam"
-version = "1.0.0"
+version = "1.1.0"
 description = "GPU camera colour engines (Fujifilm X100VI, Leica M9 / M10-R / M Typ 240) for any RAW + Adobe Standard DCP"
 requires-python = ">=3.10"
 dependencies = ["numpy", "torch", "rawpy", "tifffile", "pillow", "threadpoolctl"]
